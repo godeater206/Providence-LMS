@@ -1,2 +1,9 @@
-# machine-specific configuration and runtime artefacts - never commit these
+# machine-specific configuration and runtime artefacts — never commit these
 llmmon/.env
+llmmon/.env.pre-installer.bak
+llmmon/ssh/
+llmmon/*.log
+llmmon/__pycache__/
+
+# ad-hoc backups people make while editing server.py on a live box
+*.bak
