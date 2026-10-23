@@ -1,0 +1,48 @@
+services:
+  llmmon:
+    build: .
+    image: llmmon:latest
+    container_name: llmmon
+    # host networking: dashboard on :8899 for the LAN, and the container can reach the
+    # llama-server backends + lms daemon on 127.0.0.1 without any port mapping.
+    network_mode: host
+    # host PID namespace: /proc gives real CPU usage/uptime, lets us read the backend
+    # api-key from /proc/<pid>/cmdline and signal orphaned llama-server processes.
+    pid: host
+    # The docker-default AppArmor profile blocks container->host kill(2) with EPERM;
+    # "Restart LMS" needs to signal a HOST-owned llmster/llama-server, so unconfined.
+    security_opt:
+      - apparmor=unconfined
+    gpus: all                       # NVIDIA Container Toolkit injects the driver
+    environment:
+      LLMON_HOSTNAME: ${LLMON_HOSTNAME:-}                    # blank -> kernel hostname
+      LLMON_PORT: ${LLMON_PORT:-8899}
+      LLMON_LMS_HOME: /root/.lmstudio                        # in-container view of LMS_HOME
+      LLMON_DISK_PATH: /root/.lmstudio                       # disk stats come from that fs
+      LLMON_RAPL_FILE: ${LLMON_RAPL_FILE:-/rapl/intel-rapl/intel-rapl:0/energy_uj}
+      LLMON_REBOOT_SSH: ${LLMON_REBOOT_SSH:-}                # blank -> reboot button disabled
+      LLMON_REBOOT_KEY: /root/llmmon/ssh/id_ed25519
+      # Load buttons. Blank/unset falls back to the default baked into server.py.
+      LLMON_MODEL_A_KEY: ${LLMON_MODEL_A_KEY:-}
+      LLMON_MODEL_A_ID: ${LLMON_MODEL_A_ID:-}
+      LLMON_MODEL_A_CTX: ${LLMON_MODEL_A_CTX:-}
+      LLMON_MODEL_B_KEY: ${LLMON_MODEL_B_KEY:-}
+      LLMON_MODEL_B_ID: ${LLMON_MODEL_B_ID:-}
+      LLMON_MODEL_B_CTX: ${LLMON_MODEL_B_CTX:-}
+    volumes:
+      # server.py + logs live on the host, so updating code is `git pull` + restart.
+      - ${LLMON_DIR:?set LLMON_DIR in .env to this directory's absolute path}:/root/llmmon
+      # lms CLI, daemon state, server-logs and models. The container runs as root, so
+      # files it creates under here become root-owned on the host (normal for this setup).
+      - ${LMS_HOME:?set LMS_HOME in .env to the absolute path of ~/.lmstudio}:/root/.lmstudio
+      - /sys/class/hwmon:/sys/class/hwmon:ro                 # CPU (k10temp/zenpower) + NVMe temps
+      # RAPL energy counter. /sys/class/powercap/* are symlinks into the virtual path, and
+      # a masking tmpfs is stacked over it inside containers — so mount the real dir at /rapl.
+      - /sys/devices/virtual/powercap:/rapl:ro
+      - /var/run/docker.sock:/var/run/docker.sock            # optional Home Assistant card
+    restart: unless-stopped         # survives host reboots; a manual `docker stop` stays stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
