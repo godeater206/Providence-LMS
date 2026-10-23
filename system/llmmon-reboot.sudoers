@@ -1,0 +1,4 @@
+# Allow the dashboard's reboot button to run the helper without a password.
+# install.sh writes this file as /etc/sudoers.d/llmmon-reboot (mode 440) with the real
+# username substituted; edit the %USER% below if you are installing by hand.
+%USER% ALL=(ALL) NOPASSWD: /usr/local/bin/reboot_server.sh

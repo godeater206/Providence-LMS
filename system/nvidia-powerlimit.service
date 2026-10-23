@@ -1,0 +1,13 @@
+[Unit]
+Description=NVIDIA persistence mode + per-GPU power limit
+Documentation=https://github.com/godeater206/Providence-LMS
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Written by install.sh --gpu-watt=N (idempotent: re-run the installer to change the cap).
+ExecStart=/usr/local/bin/nvidia-powerlimit.sh
+
+[Install]
+WantedBy=multi-user.target
