@@ -2,7 +2,8 @@
 # llmmon container entrypoint:
 #  0) set up an XDG runtime dir: LM Studio (llmster is Electron-based) wants
 #     one; root has none in the container and /run/user/1000 belongs to
-#     krishna. Without it `lms` can TALK to a running daemon but fails to
+#     the host user (UID 1000). Without it `lms` can TALK to a running daemon
+#     but fails to
 #     START a new one ("Failed to start or connect to local LM Studio API").
 #  1) in the background: ensure the LM Studio daemon is up and report which
 #     models are loaded. Idempotent — no-ops when the daemon/model already

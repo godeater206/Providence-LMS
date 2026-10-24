@@ -24,7 +24,7 @@ Useful flags (pass them after `bash -s --`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/godeater206/Providence-LMS/main/install.sh \
-  | sudo bash -s -- --user=krishna --port=8899 --gpu-watt=225 --tailscale
+  | sudo bash -s -- --port=8899 --gpu-watt=225 --tailscale
 ```
 
 | Flag | Meaning |
@@ -226,7 +226,7 @@ docs/OPERATIONS.md          ← API reference, env vars, runbook, troubleshootin
 
 ## Provenance
 
-This is the production stack of a home-lan box (`providence-llm`): 4× RTX 3090 at a 225 W cap, AMD EPYC,
+This is the production stack of a home-LAN box: 4× RTX 3090 at a 225 W cap, AMD EPYC,
 123 GiB RAM, Ubuntu Server, LM Studio serving an 84 GB Qwen MoE at 262 K context over LM Link. The
 dashboard has run that rig since 2026-09; the installer and `.env` configuration layer were added to make
 the same setup reproducible on a new machine.

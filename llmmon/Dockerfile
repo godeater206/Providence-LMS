@@ -1,4 +1,4 @@
-# llmmon — providence-llm dashboard (docker)
+# llmmon — LM Studio + multi-GPU box dashboard (docker)
 #
 # python:3.12-slim + the two small host tools the container needs:
 #   procps         -> pgrep/pkill for ops + diagnostics. The "Restart LMS"

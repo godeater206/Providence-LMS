@@ -997,7 +997,7 @@ def _self_reexec():
 # ---------------------------------------------------------------- http
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ProvMon/1.0"
+    server_version = "llmmon/1.0"
 
     def log_message(self, *a):
         pass
@@ -1097,7 +1097,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>providence-llm · monitor</title>
+<title>__HOSTNAME__ · monitor</title>
 <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/Physics2DPlugin.min.js"></script>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Poppins:wght@600&display=swap">
@@ -1360,7 +1360,7 @@ HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>⚡ providence-llm</h1>
+  <h1>⚡ __HOSTNAME__</h1>
   <span class="live"><span class="dot" id="livedot"></span><span id="livetxt">connecting…</span></span>
   <span class="meta" id="meta"></span>
 </header>
@@ -1452,7 +1452,7 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<div class="foot">providence-llm monitor · docker · stdlib http server · refresh 2s · drag cards to reorder (saved per browser)</div>
+<div class="foot">__HOSTNAME__ monitor · docker · stdlib http server · refresh 2s · drag cards to reorder (saved per browser)</div>
 
 <script>
 const GC = ['#22d3ee','#4ade80','#fbbf24','#f472b6'];
@@ -2049,9 +2049,11 @@ tick(); setInterval(tick, 2000);
 </html>
 """
 
-# Button labels + the hint line are filled from the configured identifiers/keys,
-# so editing .env and restarting the container is all it takes to retarget them.
-PAGE = (HTML.replace("__MODEL_A_ID__", LMS_LOAD_IDENTIFIER)
+# Title/header/footer text, button labels and the hint line are all filled from
+# configuration, so editing .env and restarting the container is all it takes to
+# retarget a new machine — nothing box-specific is baked into this file.
+PAGE = (HTML.replace("__HOSTNAME__", HOSTNAME)
+            .replace("__MODEL_A_ID__", LMS_LOAD_IDENTIFIER)
             .replace("__MODEL_B_ID__", LMS_LOAD_FN_IDENTIFIER)
             .replace("__MODEL_A_HINT__", "load %s · ctx %s" % (LMS_LOAD_MODEL_KEY, LMS_LOAD_CTX)))
 
