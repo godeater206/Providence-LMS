@@ -8,8 +8,9 @@
 #   openssh-client -> reboot  (the Reboot button SSHes to the host and runs the
 #                        existing /usr/local/bin/reboot_server.sh via its sudoers rule)
 #
-# server.py + load_model.sh are NOT baked in — they come from the mounted
-# ~/llmmon dir (/root/llmmon), so a code update is: edit file + docker restart.
+# server.py + load_model.sh are NOT baked in — they come from the host directory
+# bind-mounted at /root/llmmon (compose sets it from LLMON_DIR in .env), so a code
+# update is: git pull + docker restart llmmon. No rebuild needed.
 FROM python:3.12-slim
 
 RUN apt-get update \
