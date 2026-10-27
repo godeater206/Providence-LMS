@@ -46,7 +46,10 @@ curl -fsSL https://raw.githubusercontent.com/godeater206/Providence-LMS/main/ins
 **Dashboard** (`http://<server-ip>:8899`, dark theme, auto-refresh every 2 s)
 
 - Per-GPU cards: temperature, power draw vs limit, utilisation, VRAM used/total, fan %, clock — with bars
-- System cards: CPU package power (RAPL), CPU + NVMe temperatures, load average, RAM/swap, disk usage
+- System cards: CPU package power (RAPL, instantaneous and rollover-corrected), CPU + NVMe temperatures,
+  load average, RAM/swap, disk usage
+- Header chip with **live CPU GHz** — fastest active core, hover for avg / min / boost ceiling — read from
+  `cpufreq scaling_cur_freq` so it tracks what the governor is actually doing
 - LM Studio card: which model is loaded, context length, parallel slots (live per-slot pips),
   generate/prompt **tok/s**, speculative draft acceptance, recent requests
 - Two **load buttons** whose labels are the identifiers they load, plus **Unload All** and **Restart LMS**

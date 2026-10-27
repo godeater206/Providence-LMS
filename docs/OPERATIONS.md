@@ -50,6 +50,30 @@ Long operations report progress through the `ctl` object inside `/api/stats`:
 screen for 10 s. Concurrency is guarded: a second control request while one is running gets HTTP 409
 `{"error": "operation already in progress"}`.
 
+### What `/api/stats` returns
+
+`current` carries `ts`, `time`, `hostname`, then grouped objects:
+
+| Group | Fields |
+|---|---|
+| `cpu` | `temp_c`, `usage_pct`, `cores`, and live frequency: `ghz` (fastest active core), `avg_ghz`, `min_ghz`, `boost_ghz`, `freq_source` |
+| `mem` / `load` / `disk` | GB + percentages; load average and uptime string; disk is the filesystem at `LLMON_DISK_PATH` |
+| `nvme_temps`, `sys_power_w` | hwmon drive temperatures; RAPL package power in watts |
+| `gpus[]` | one entry per GPU: `index`, `name`, `pci_bus_id`, `temp_c`, `power_w`, `power_limit_w`, `util_pct`, `mem_util_pct`, `mem_used_mib`, `mem_total_mib`, `fan_pct`, `clock_mhz` |
+| `lmstudio` | `available`, `instances[]` (identifier, model, quant, size, status, context, parallel), `gen_tps`, `prompt_tps`, `draft_acceptance`, `active_slots`, `recent_requests`, plus the `ctl` and `heal` objects above |
+
+`history` holds one array per metric — `t` (HH:MM:SS labels, not epoch), `sys_power`, `cpu_temp`,
+`cpu_usage`, `cpu_ghz`, `mem_used`, `swap_used`, `gpu_temp`/`gpu_power`/`gpu_util`/`gpu_mem`, `gen_tps`,
+`prompt_tps`, `lm_slots`. Every `gpu_*` sample carries one value **per GPU**, so index it as
+`history.gpu_temp[i][gpu_index]`. Two things to expect: `sys_power[0]` is always `null` (that first sample
+only records the RAPL baseline), and the buffer lives in RAM — it refills from zero after every container
+restart.
+
+The GHz figures come from `/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq`, i.e. what the governor
+actually runs; boards without cpufreq fall back to `/proc/cpuinfo` (hence `freq_source`). Prefer the cpufreq
+source: the cpuinfo "cpu MHz" field is a per-task TSC estimate that can disagree with the governor by over
+1 GHz within a single sample.
+
 ```bash
 curl -s http://127.0.0.1:8899/api/stats | python3 -m json.tool | head -60
 curl -s -X POST http://127.0.0.1:8899/api/lms/load-fn
@@ -86,8 +110,12 @@ After changing `.env`: `docker restart llmmon`, then reload the page — the lab
 
 ## Self-healing behaviour (don't mistake this for a crash)
 
-- **RAPL counter wedge** → if CPU power sits near 0 W for ~90 s after healthy readings, the process exits
-  and Docker respawns it with a clean baseline. Expect occasional `RAPL stuck near 0W …` log lines.
+- **RAPL counter wedge** → package power is the delta between *consecutive* reads of the energy counter,
+  corrected for its rollover at `max_energy_range_uj` (on many boards that wraps roughly every 20 min at
+  idle draw). If the counter stops advancing **at all** for ~90 s after healthy readings, the process exits
+  and Docker respawns it with a clean baseline; the exit line prints the raw `e0`/`e`/`dt`/`wrap` values.
+  A reading that is low but still counting is treated as data — ~10 min below 10 W logs one warning and keeps
+  running, because an idle CPU package genuinely draws that little.
 - **Daemon revival** → when `lms ps` starts failing, llmmon tries `lms daemon up` on its own (`heal` object in `/api/stats`).
 - **Orphan sweep** → after SIGKILLing a daemon, leftover `llama-server` processes are killed explicitly so VRAM is released. If an orphan is owned by the host and AppArmor blocks the signal, the unload message warns you to `pkill -f llama-server` over SSH.
 - **Boot bootstrap does not auto-load models** — it waits for the API and reports what is loaded. Models come up when you press a button (by design: an 84 GB load should be a decision, not a boot side-effect).
