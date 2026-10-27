@@ -119,6 +119,68 @@ def cpu_usage():
         return None
     return round(100.0 * (dt - (idle - p_idle)) / dt, 1)
 
+# ---- live CPU frequency -------------------------------------------------------
+# Cores on this EPYC board boost independently under the schedutil governor, so the
+# header shows the fastest active core and keeps avg/min/ceiling for the tooltip.
+# scaling_cur_freq is preferred over /proc/cpuinfo's "cpu MHz": that field is a per-task
+# TSC estimate and disagrees with what the governor actually runs (observed 2.49 GHz next
+# to 3.89 GHz in one sample). The container sees this sysfs tree without an extra bind
+# mount; where cpufreq is absent, fall back to /proc/cpuinfo so a fresh install still
+# reports something rather than "—".
+CPUFREQ_DIR = "/sys/devices/system/cpu"
+
+def _cpu_dirs():
+    try:
+        return sorted(n for n in os.listdir(CPUFREQ_DIR) if re.fullmatch(r"cpu\d+", n))
+    except OSError:
+        return []
+
+def _read_khz(path):
+    try:
+        with open(path) as f:
+            khz = int(f.read().strip())
+        return khz if khz > 0 else None
+    except (OSError, ValueError):
+        return None
+
+def _cpuinfo_mhz():
+    vals = []
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.lower().startswith("cpu mhz"):
+                    khz = int(float(line.split(":", 1)[1].strip()) * 1000)
+                    if khz > 0:
+                        vals.append(khz)
+    except (OSError, ValueError):
+        return []
+    return vals
+
+def cpu_ghz():
+    """Current CPU frequency in GHz: fastest / average / slowest core + boost ceiling."""
+    dirs = _cpu_dirs()
+    cur, ceiling = [], None
+    for d in dirs:
+        khz = _read_khz(os.path.join(CPUFREQ_DIR, d, "cpufreq", "scaling_cur_freq"))
+        if khz:
+            cur.append(khz)
+        if ceiling is None:
+            ceiling = _read_khz(os.path.join(CPUFREQ_DIR, d, "cpufreq", "cpuinfo_max_freq"))
+    source = "cpufreq"
+    if not cur:
+        cur, source = _cpuinfo_mhz(), "cpuinfo"
+    if not cur:
+        return {"ghz": None, "avg_ghz": None, "min_ghz": None,
+                "boost_ghz": None, "freq_source": None}
+    top = ceiling or max(cur)
+    return {
+        "ghz": round(max(cur) / 1e6, 2),
+        "avg_ghz": round(sum(cur) / len(cur) / 1e6, 2),
+        "min_ghz": round(min(cur) / 1e6, 2),
+        "boost_ghz": round(top / 1e6, 2),
+        "freq_source": source,
+    }
+
 def meminfo():
     info = {}
     with open("/proc/meminfo") as f:
@@ -193,10 +255,16 @@ def gpus():
         return []
 
 # ---- system power via RAPL (root-only energy counter)
-_rapl_last = None            # (energy_uj, timestamp)
+_rapl_lock = threading.Lock()
+_rapl_last = None            # (energy_uj, timestamp) of the last *usable* sample
+_rapl_good_w = None          # last plausible wattage, reused when a sample can't be computed
+_rapl_wrap_uj = -1           # max_energy_range_uj + 1; -1 = unresolved, 0 = unavailable
 _rapl_ever_ok = False        # seen a plausible reading this process lifetime?
-_rapl_low_count = 0          # consecutive implausibly-low readings
-_RAPL_RESTART_AFTER = 45     # ~90 s of <1 W readings after being healthy => self-restart
+_rapl_frozen_count = 0       # consecutive reads where the counter did not advance
+_rapl_low_count = 0          # consecutive advancing-but-below-10 W reads (real load)
+_rapl_warned_low = False     # one-shot log flag per low-power episode
+_RAPL_RESTART_AFTER = 45     # ~90 s of a frozen counter after being healthy => self-restart
+_RAPL_WARN_LOW_AFTER = 300   # ~10 min below 10 W while still counting => warn, keep running
 
 def _read_rapl_uj():
     """Read the RAPL energy counter. Direct file read first (works in the
@@ -214,39 +282,97 @@ def _read_rapl_uj():
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
 
-def sys_power_w():
-    """Package power from the RAPL energy counter (delta between reads).
+def _rapl_wrap_period():
+    """Counter modulus for wraparound correction: max_energy_range_uj + 1.
 
-    Self-heal: if readings were once healthy and then stick below 1 W for
-    ~90 s, the counter/process state is wedged (observed 2026-09-09: stuck at
-    ~0.2 W for hours after a counter-reset event). Exit; the supervisor
-    (docker restart policy / systemd) respawns us with a clean baseline.
-    (Only after a healthy reading, so a machine that is genuinely broken
-    from the start won't loop.)"""
-    global _rapl_last, _rapl_ever_ok, _rapl_low_count
+    The package counter is a free-running microjoule accumulator that rolls over at
+    max_energy_range_uj (65 532 610 987 uJ on this board, i.e. roughly every 20 min
+    at idle), so one delta per rollover comes back negative. Read the sibling sysfs
+    attribute once and cache it; 0 means the file is absent (older kernels, or a
+    bare-host deploy without the mount) and no correction applies."""
+    global _rapl_wrap_uj
+    if _rapl_wrap_uj < 0:
+        try:
+            p = os.path.join(os.path.dirname(RAPL_FILE), "max_energy_range_uj")
+            with open(p) as f:
+                _rapl_wrap_uj = int(f.read().strip()) + 1
+        except (OSError, ValueError):
+            _rapl_wrap_uj = 0
+    return _rapl_wrap_uj or None
+
+def sys_power_w():
+    """Package power from the RAPL energy counter: delta between consecutive reads.
+
+    Two bugs this replaces:
+
+      * The baseline only advanced when a sample was skipped, so every reading after
+        the first was an average since process start — a 57 W spike visibly decayed
+        towards ~46 W over ten minutes and could not follow load at all.
+      * The counter rolls over at max_energy_range_uj (~65.5 kJ here: about every
+        20 min at idle). Each rollover arrived as one hugely negative delta, which
+        blanked that sample and — with the stale baseline above — dragged the running
+        average under the wedge threshold, restarting the dashboard roughly hourly.
+
+    So: add the modulus back after a rollover, advance the baseline only when a sample
+    is actually usable, and self-restart only for the real fault signature (the counter
+    stops advancing at all). A genuinely idle package still accumulates energy, so sub-10 W
+    readings are reported as data and logged once instead of killing the dashboard.
+
+    Note that this runs from two threads — the sampler loop and every `/api/stats` request
+    (`do_GET` → `snapshot()`) — hence the lock, and why a too-short interval returns the
+    previous value rather than a hole: two callers landing 0.05 s apart is normal traffic,
+    not missing data."""
+    global _rapl_last, _rapl_ever_ok, _rapl_frozen_count, _rapl_low_count
+    global _rapl_warned_low, _rapl_good_w
     e = _read_rapl_uj()
     if e is None:
-        return None
+        return _rapl_good_w
     now = time.time()
-    if _rapl_last is not None:
-        e0, t0 = _rapl_last
-        dt = now - t0
-        if dt > 0.1:
-            w = (e - e0) * 1e-6 / dt
-            if 0 <= w < 2000:
-                if w >= 10:
-                    _rapl_ever_ok = True
-                    _rapl_low_count = 0
-                elif _rapl_ever_ok:
-                    _rapl_low_count += 1
-                    if _rapl_low_count >= _RAPL_RESTART_AFTER:
-                        print("RAPL stuck near 0W for ~%ds after healthy readings; "
-                              "exiting for a clean restart (docker/systemd respawns)"
-                              % int(_RAPL_RESTART_AFTER * SAMPLE_INTERVAL), flush=True)
-                        os._exit(1)
-                return round(w, 1)
-    _rapl_last = (e, now)
-    return None
+    with _rapl_lock:
+        return _rapl_eval(e, now)
+
+def _rapl_eval(e, now):
+    """Body of sys_power_w(); called with _rapl_lock held."""
+    global _rapl_last, _rapl_ever_ok, _rapl_frozen_count, _rapl_low_count
+    global _rapl_warned_low, _rapl_good_w
+    if _rapl_last is None:
+        _rapl_last = (e, now)
+        return None                              # first sample: baseline only
+    e0, t0 = _rapl_last
+    dt = now - t0
+    if dt <= 0.5:                                # two callers raced; keep the baseline
+        return _rapl_good_w
+    de = e - e0
+    wrap = _rapl_wrap_period()
+    if de < 0 and wrap:
+        de += wrap                               # counter rolled over between reads
+    w = de * 1e-6 / dt
+    if not (0 <= w < 2000):                      # implausible jump: glitch, keep last value
+        return _rapl_good_w
+    if de <= 0:                                  # wedged counter: no energy accumulated
+        _rapl_frozen_count += 1
+        if _rapl_ever_ok and _rapl_frozen_count >= _RAPL_RESTART_AFTER:
+            print("RAPL counter frozen (no advance) for ~%ds after healthy readings "
+                  "(e0=%d e=%d dt=%.1fs wrap=%s); exiting for a clean restart "
+                  "(docker/systemd respawns)"
+                  % (int(_RAPL_RESTART_AFTER * SAMPLE_INTERVAL), e0, e, dt, wrap), flush=True)
+            os._exit(1)
+    else:
+        _rapl_frozen_count = 0
+        if w >= 10:
+            _rapl_ever_ok = True
+            _rapl_low_count = 0
+            _rapl_warned_low = False
+        elif _rapl_ever_ok:                      # low but counting: real load, not a wedge
+            _rapl_low_count += 1
+            if _rapl_low_count >= _RAPL_WARN_LOW_AFTER and not _rapl_warned_low:
+                _rapl_warned_low = True
+                print("RAPL has reported only %.1fW for ~%ds (counter still advancing; "
+                      "treating as real load, not a wedge)"
+                      % (w, int(_RAPL_WARN_LOW_AFTER * SAMPLE_INTERVAL)), flush=True)
+    _rapl_last = (e, now)                        # advance only on a usable sample
+    _rapl_good_w = round(w, 1)
+    return _rapl_good_w
 
 # ---------------------------------------------------------------- LM Studio
 
@@ -921,7 +1047,8 @@ def snapshot():
         "ts": time.time(),
         "time": datetime.now().strftime("%H:%M:%S"),
         "hostname": HOSTNAME,
-        "cpu": {"temp_c": cpu_temp(), "usage_pct": cpu_usage(), "cores": os.cpu_count()},
+        "cpu": {"temp_c": cpu_temp(), "usage_pct": cpu_usage(),
+                "cores": os.cpu_count(), **cpu_ghz()},
         "mem": meminfo(),
         "load": load_uptime(),
         "disk": disk(),
@@ -961,6 +1088,7 @@ def history_json():
         "sys_power": [s["sys_power_w"] for s in items],
         "cpu_temp": [s["cpu"]["temp_c"] for s in items],
         "cpu_usage": [s["cpu"]["usage_pct"] for s in items],
+        "cpu_ghz": [s["cpu"]["ghz"] for s in items],
         "mem_used": [s["mem"]["used_gb"] for s in items],
         "swap_used": [s["mem"]["swap_used_gb"] for s in items],
         "gpu_temp": [[g["temp_c"] for g in s["gpus"]] for s in items],
@@ -1126,6 +1254,13 @@ HTML = r"""<!DOCTYPE html>
     border:1px solid var(--stroke);padding:4px 10px;border-radius:99px}
   .live .dot{width:8px;height:8px;border-radius:50%;background:#4ade80;
     box-shadow:0 0 8px #4ade80;animation:pulse 1.6s infinite}
+  .chip{display:inline-flex;align-items:center;justify-content:center;gap:6px;
+    border:1px solid var(--stroke);padding:4px 10px;border-radius:99px;
+    font-family:ui-monospace,monospace;font-size:12px;color:var(--dim)}
+  /* min-width:4ch equals the width of a real reading ("3.89") in this monospace font, so
+     the pill never resizes as digits change yet has no dead space around the number. */
+  .chip b{color:var(--cpu);font-weight:700;font-size:13px;min-width:4ch;text-align:center}
+  .chip.boost b{color:#f0abfc;text-shadow:0 0 8px rgba(240,171,252,.45)}
   @keyframes pulse{50%{opacity:.35}}
   .grid{display:grid;gap:16px}
   .top{grid-template-columns:repeat(auto-fit,minmax(215px,1fr))}
@@ -1362,6 +1497,7 @@ HTML = r"""<!DOCTYPE html>
 <header>
   <h1>⚡ __HOSTNAME__</h1>
   <span class="live"><span class="dot" id="livedot"></span><span id="livetxt">connecting…</span></span>
+  <span class="chip" id="ghzchip" title="CPU frequency"><b id="cpughz">—</b>GHz</span>
   <span class="meta" id="meta"></span>
 </header>
 
@@ -1825,6 +1961,12 @@ async function tick(){
     const c = j.current;
     $('livedot').style.background = '#4ade80';
     $('livetxt').textContent = 'live · ' + c.time;
+    const ghz = c.cpu.ghz, ceil = c.cpu.boost_ghz;
+    $('cpughz').textContent = fmt(ghz, 2);
+    $('ghzchip').title = ghz == null
+      ? 'no cpufreq source on this host'
+      : `fastest core ${fmt(ghz,2)} GHz · avg ${fmt(c.cpu.avg_ghz,2)} · min ${fmt(c.cpu.min_ghz,2)} · ceiling ${fmt(ceil,2)} (${c.cpu.freq_source})`;
+    $('ghzchip').classList.toggle('boost', ghz != null && ceil != null && ghz >= ceil - 0.05);
     $('meta').textContent = `${c.hostname} · up ${c.load.uptime} · load ${c.load.load.join(' / ')} · ${c.cpu.cores} cores`;
 
     $('syspower').innerHTML = fmt(c.sys_power_w) + '<small> W</small>';
